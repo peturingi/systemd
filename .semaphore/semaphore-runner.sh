@@ -4,10 +4,10 @@
 set -eux
 set -o pipefail
 
-DISTRO="${DISTRO:-debian}"
-RELEASE="${RELEASE:-trixie}"
-SALSA_URL="${SALSA_URL:-https://salsa.debian.org/systemd-team/systemd.git}"
-BRANCH="${BRANCH:-debian/master}"
+DISTRO="${DISTRO:-ubuntu}"
+RELEASE="${RELEASE:-resolute}"
+PKG_URL="${PKG_URL:-https://github.com/systemd/systemd-deb.git}"
+BRANCH="${BRANCH:-deb/main}"
 ARCH="${ARCH:-amd64}"
 CONTAINER="${RELEASE}-${ARCH}"
 CACHE_DIR=/var/tmp
@@ -32,35 +32,40 @@ create_container() {
 lxc.apparmor.profile = unconfined
 lxc.mount.auto =
 lxc.mount.auto = proc:mixed sys:mixed
-lxc.init.cmd = /sbin/init systemd.unified_cgroup_hierarchy=1
+lxc.init.cmd = /sbin/init systemd.unified_cgroup_hierarchy=1 systemd.mask=netplan-configure.service
 EOF
 
     sudo lxc-start -n "$CONTAINER" --define "lxc.include=/var/lib/lxc/$CONTAINER/config.systemd_upstream"
 
-    # enable source repositories so that apt-get build-dep works
     sudo lxc-attach -n "$CONTAINER" -- sh -ex <<EOF
+# enable source repositories so that apt-get build-dep works
 sed 's/^deb/deb-src/' /etc/apt/sources.list >>/etc/apt/sources.list.d/sources.list
-echo "deb http://deb.debian.org/debian $RELEASE-backports main" >/etc/apt/sources.list.d/backports.list
 # We might attach the console too soon
 until systemctl --quiet --wait is-system-running; do sleep 1; done
+# LXC uses a veth
+mkdir -p /etc/systemd/network/
+cat >/etc/systemd/network/10-eth0.network <<NETWORK
+[Match]
+Name=eth0
+[Network]
+DHCP=yes
+KeepConfiguration=yes
+NETWORK
+systemctl unmask systemd-networkd
+systemctl enable --now systemd-networkd
+networkctl reload
+/usr/lib/systemd/systemd-networkd-wait-online --interface=eth0:routable --ipv4 --timeout=60
 # Manpages database trigger takes a lot of time and is not useful in a CI
 echo 'man-db man-db/auto-update boolean false' | debconf-set-selections
 # Speed up dpkg, image is thrown away after the test
 mkdir -p /etc/dpkg/dpkg.cfg.d/
 echo 'force-unsafe-io' >/etc/dpkg/dpkg.cfg.d/unsafe_io
-# For some reason, it is necessary to run this manually or the interface won't be configured
-# Note that we avoid networkd, as some of the tests will break it later on
-dhclient
 apt-get -q --allow-releaseinfo-change update
 apt-get -y dist-upgrade
 apt-get install -y eatmydata
-# The following four are needed as long as these deps are not covered by Debian's own packaging
-apt-get install -y tree libpwquality-dev rpm libcurl4-openssl-dev libarchive-dev
-# autopkgtest doesn't consider backports
-apt-get install -y -t $RELEASE-backports debhelper
+# The following are needed as long as these deps are not covered by Debian's own packaging
+apt-get install -y tree rpm
 apt-get purge --auto-remove -y unattended-upgrades
-systemctl unmask systemd-networkd
-systemctl enable systemd-networkd
 EOF
     sudo lxc-stop -n "$CONTAINER"
 }
@@ -83,7 +88,7 @@ for phase in "${PHASES[@]}"; do
         ;;
         RUN)
             # add current debian/ packaging
-            git fetch --depth=1 "$SALSA_URL" "$BRANCH"
+            git fetch --depth=1 "$PKG_URL" "$BRANCH"
             git checkout FETCH_HEAD debian
 
             # craft changelog
@@ -93,7 +98,7 @@ systemd (${UPSTREAM_VER}.0) UNRELEASED; urgency=low
 
   * Automatic build for upstream test
 
- -- systemd test <pkg-systemd-maintainers@lists.alioth.debian.org>  $(date -R)
+ -- systemd test <systemd-devel@lists.freedesktop.org>  $(date -R)
 
 EOF
             cat debian/changelog >>debian/changelog.new

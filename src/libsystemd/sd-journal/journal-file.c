@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "sd-event.h"
+#include "sd-journal.h"
 
 #include "alloc-util.h"
 #include "chattr-util.h"
@@ -80,7 +81,7 @@
 #define HEADER_SIZE_MIN ALIGN64(offsetof(Header, n_data))
 
 /* How many entries to keep in the entry array chain cache at max */
-#define CHAIN_CACHE_MAX 20
+#define CHAIN_CACHE_MAX 64
 
 /* How much to increase the journal file size at once each time we allocate something new. */
 #define FILE_SIZE_INCREASE (8 * U64_MB)                  /* 8MB */
@@ -391,11 +392,13 @@ static Compression compression_requested(void) {
 static int journal_file_init_header(
                 JournalFile *f,
                 JournalFileFlags file_flags,
-                JournalFile *template) {
+                JournalFile *template,
+                const sd_id128_t *seqnum_id) {
 
         int r;
 
         assert(f);
+        POINTER_MAY_BE_NULL(seqnum_id);
 
         /* Try to load the FSPRG state, and if we can't, then just don't do sealing */
         bool seal = FLAGS_SET(file_flags, JOURNAL_SEAL) && journal_file_auth_load(f) >= 0;
@@ -423,10 +426,16 @@ static int journal_file_init_header(
                 return r; /* If we have no valid machine ID (test environment?), let's simply leave the
                            * machine ID field all zeroes. */
 
-        if (template) {
-                h.seqnum_id = template->header->seqnum_id;
+        if (template)
                 h.tail_entry_seqnum = template->header->tail_entry_seqnum;
-        } else
+
+        /* The sequence number ID of the caller takes precedence over the one of the template. The first
+         * entry appended to an empty file also replaces the ID in the header with the one of the caller. */
+        if (seqnum_id && !sd_id128_is_null(*seqnum_id))
+                h.seqnum_id = *seqnum_id;
+        else if (template)
+                h.seqnum_id = template->header->seqnum_id;
+        else
                 h.seqnum_id = h.file_id;
 
         return pwrite_full(f->fd, &h, sizeof(h), 0);
@@ -553,11 +562,15 @@ static int journal_file_verify_machine_id(JournalFile *f) {
         return 0;
 }
 
-static int journal_file_verify_header(JournalFile *f) {
-        uint64_t arena_size, header_size;
+int journal_file_verify_header(JournalFile *f) {
+        int r;
 
         assert(f);
         assert(f->header);
+
+        /* EBADMSG: corrupted
+         * ENODATA: truncated
+         * EPROTONOSUPPORT: uses an unsupported feature */
 
         if (memcmp(f->header->signature, HEADER_SIGNATURE, 8) != 0)
                 return -EBADMSG;
@@ -571,46 +584,80 @@ static int journal_file_verify_header(JournalFile *f) {
         if (journal_file_writable(f) && warn_wrong_flags(f, true))
                 return -EPROTONOSUPPORT;
 
-        if (f->header->state >= _STATE_MAX)
+        uint8_t state = READ_NOW(f->header->state);
+        if (state >= _STATE_MAX)
                 return -EBADMSG;
 
-        header_size = le64toh(READ_NOW(f->header->header_size));
+        uint64_t header_size = le64toh(READ_NOW(f->header->header_size));
 
         /* The first addition was n_data, so check that we are at least this large */
         if (header_size < HEADER_SIZE_MIN)
                 return -EBADMSG;
 
-        /* When open for writing we refuse to open files with a mismatch of the header size, i.e. writing to
-         * files implementing older or new header structures. */
-        if (journal_file_writable(f) && header_size != sizeof(Header))
-                return -EPROTONOSUPPORT;
+        if (journal_file_writable(f)) {
+                r = journal_file_verify_machine_id(f);
+                if (r < 0)
+                        return r;
 
-        /* Don't write to journal files without the new boot ID update behavior guarantee. */
-        if (journal_file_writable(f) && !JOURNAL_HEADER_TAIL_ENTRY_BOOT_ID(f->header))
-                return -EPROTONOSUPPORT;
+                switch (state) {
+                case STATE_OFFLINE:
+                        break; /* expected */
+                case STATE_ONLINE:
+                        return log_debug_errno(SYNTHETIC_ERRNO(EBUSY),
+                                               "Journal file %s is already online. Assuming unclean closing.",
+                                               f->path);
+                case STATE_ARCHIVED:
+                        return -ESHUTDOWN; /* Already archived */
+                default:
+                        assert_not_reached();
+                }
+
+                if (f->header->field_hash_table_size == 0 || f->header->data_hash_table_size == 0)
+                        return -EBADMSG;
+
+                /* When open for writing we refuse to open files with a mismatch of the header size, i.e. writing to
+                 * files implementing older or new header structures. */
+                if (header_size != sizeof(Header))
+                        return -EPROTONOSUPPORT;
+
+                /* Don't write to journal files without the new boot ID update behavior guarantee. */
+                if (!JOURNAL_HEADER_TAIL_ENTRY_BOOT_ID(f->header))
+                        return -EPROTONOSUPPORT;
+        }
 
         if (JOURNAL_HEADER_SEALED(f->header) && !JOURNAL_HEADER_CONTAINS(f->header, n_entry_arrays))
                 return -EBADMSG;
 
-        arena_size = le64toh(READ_NOW(f->header->arena_size));
-
-        if (UINT64_MAX - header_size < arena_size)
-                return -ENODATA;
+        /* On write, we should not append any new entries on broken file, so verify the header strictly.
+         * Also, do so when we are verifying the journal file by journal_file_verify(), but only when the
+         * file is already archived. Non-archived files may be updated while we are verifying, hence some
+         * header values may be inconsistent. */
+        bool strict = journal_file_writable(f) || (f->verifying && state == STATE_ARCHIVED);
 
         uint64_t file_size = (uint64_t) f->last_stat.st_size;
 
+        /* Read these header values in the reverse order on write:
+         * 1. arena_size is updated first when allocating space for a new object,
+         * 2. tail_object_offset is updated after the object is written,
+         * 3. entry_array_offset is set when the object is an entry array object. */
+        uint64_t entry_array_offset = le64toh(READ_NOW(f->header->entry_array_offset));
+        uint64_t tail_object_offset = le64toh(READ_NOW(f->header->tail_object_offset));
+        uint64_t arena_size = le64toh(READ_NOW(f->header->arena_size));
+
+        if (UINT64_MAX - header_size < arena_size)
+                return -EBADMSG;
+
         /* Probably an unclean shutdown where the header was written, but the arena data was not. On write we
          * should ask the caller to rotate, but on read, we can still work it out with bounds checks. */
-        bool truncated = false;
         if (header_size + arena_size > file_size) {
-                if (journal_file_writable(f))
+                if (strict)
                         return -ENODATA;
 
                 /* This shouldn't happen given file_size is page aligned via fallocate(), but just in case
                  * things are _really_ messed up... */
                 uint64_t available = ALIGN_DOWN_U64(file_size, sizeof(uint64_t));
                 if (header_size > available || available - header_size < offsetof(ObjectHeader, payload))
-                        return -ENODATA;
+                        return -EBADMSG;
 
                 log_debug("Journal file %s claims a %" PRIu64 " byte arena but is only %" PRIu64
                           " bytes on disk, clamping for recovery.",
@@ -618,37 +665,34 @@ static int journal_file_verify_header(JournalFile *f) {
                           arena_size,
                           file_size);
                 arena_size = available - header_size;
-                truncated = true;
+                tail_object_offset = MIN(tail_object_offset, available - offsetof(ObjectHeader, payload));
         }
 
-        uint64_t tail_object_offset = le64toh(f->header->tail_object_offset);
-        if (truncated)
-                /* The tail may be in the lost region, so cap it at the last possible object header start. */
-                tail_object_offset = MIN(
-                                tail_object_offset,
-                                header_size + arena_size - offsetof(ObjectHeader, payload));
-        if (!offset_is_valid(tail_object_offset, header_size, UINT64_MAX))
-                return -ENODATA;
-        if (header_size + arena_size < tail_object_offset)
-                return -ENODATA;
-        if (header_size + arena_size - tail_object_offset < offsetof(ObjectHeader, payload))
-                return -ENODATA;
+        if (!offset_is_valid(tail_object_offset, header_size, header_size + arena_size - offsetof(ObjectHeader, payload)))
+                return -EBADMSG;
 
         if (!hash_table_is_valid(le64toh(f->header->data_hash_table_offset),
                                  le64toh(f->header->data_hash_table_size),
                                  header_size, arena_size, tail_object_offset))
-                return -ENODATA;
+                return -EBADMSG;
 
         if (!hash_table_is_valid(le64toh(f->header->field_hash_table_offset),
                                  le64toh(f->header->field_hash_table_size),
                                  header_size, arena_size, tail_object_offset))
-                return -ENODATA;
+                return -EBADMSG;
 
-        uint64_t entry_array_offset = le64toh(f->header->entry_array_offset);
         if (!offset_is_valid(entry_array_offset, header_size, tail_object_offset))
-                return -ENODATA;
+                return -EBADMSG;
 
-        if (!truncated && JOURNAL_HEADER_CONTAINS(f->header, tail_entry_array_offset)) {
+        /* When the file is opened for reading, we skip the verifications below.
+         * a) Even if it is corrupted, still there may be some data readable with some methods. Let's try to
+         *    extract what we can instead of rejecting the entire file.
+         * b) The file may be concurrently written by e.g., journald, and any tail offsets and/or counters
+         *    may be temporarily inconsistent. */
+        if (!strict)
+                return 0;
+
+        if (JOURNAL_HEADER_CONTAINS(f->header, tail_entry_array_offset)) {
                 uint32_t offset = le32toh(f->header->tail_entry_array_offset);
                 uint32_t n = le32toh(f->header->tail_entry_array_n_entries);
 
@@ -665,7 +709,7 @@ static int journal_file_verify_header(JournalFile *f) {
                         return -ENODATA;
         }
 
-        if (!truncated && JOURNAL_HEADER_CONTAINS(f->header, tail_entry_offset)) {
+        if (JOURNAL_HEADER_CONTAINS(f->header, tail_entry_offset)) {
                 uint64_t offset = le64toh(f->header->tail_entry_offset);
 
                 if (!offset_is_valid(offset, header_size, tail_object_offset))
@@ -697,7 +741,7 @@ static int journal_file_verify_header(JournalFile *f) {
 
         /* Verify number of objects */
         uint64_t n_objects = le64toh(f->header->n_objects);
-        if (!truncated && n_objects > arena_size / offsetof(ObjectHeader, payload))
+        if (n_objects > arena_size / offsetof(ObjectHeader, payload))
                 return -ENODATA;
 
         uint64_t n_entries = le64toh(f->header->n_entries);
@@ -723,31 +767,6 @@ static int journal_file_verify_header(JournalFile *f) {
         if (JOURNAL_HEADER_CONTAINS(f->header, tail_entry_array_n_entries) &&
             le32toh(f->header->tail_entry_array_n_entries) > n_entries)
                 return -ENODATA;
-
-        if (journal_file_writable(f)) {
-                uint8_t state;
-                int r;
-
-                r = journal_file_verify_machine_id(f);
-                if (r < 0)
-                        return r;
-
-                state = f->header->state;
-
-                if (state == STATE_ARCHIVED)
-                        return -ESHUTDOWN; /* Already archived */
-                if (state == STATE_ONLINE)
-                        return log_debug_errno(SYNTHETIC_ERRNO(EBUSY),
-                                               "Journal file %s is already online. Assuming unclean closing.",
-                                               f->path);
-                if (state != STATE_OFFLINE)
-                        return log_debug_errno(SYNTHETIC_ERRNO(EBUSY),
-                                               "Journal file %s has unknown state %i.",
-                                               f->path, state);
-
-                if (f->header->field_hash_table_size == 0 || f->header->data_hash_table_size == 0)
-                        return -EBADMSG;
-        }
 
         return 0;
 }
@@ -1786,7 +1805,7 @@ static int journal_file_find_data_object_with_hash(
                 if (le64toh(o->data.hash) != hash)
                         goto next;
 
-                r = journal_file_data_payload(f, o, p, NULL, 0, 0, &d, &rsize);
+                r = journal_file_data_payload(f, o, p, /* field= */ NULL, /* field_length= */ 0, &d, &rsize);
                 if (r < 0)
                         return r;
                 assert(r > 0); /* journal_file_data_payload() always returns > 0 if no field is provided. */
@@ -2054,11 +2073,16 @@ static int maybe_decompress_payload(
                 Compression compression,
                 const char *field,
                 size_t field_length,
-                size_t data_threshold,
+                sd_journal_data_flags_t flags,
+                int fd,
                 const void **ret_data,
                 size_t *ret_size) {
 
+        int r;
+
         assert(f);
+        assert(!field == (field_length == 0)); /* These must be specified together. */
+        assert(fd < 0 || !ret_data); /* fd and ret_data cannot be specified together. */
 
         /* We can't read objects larger than 4G on a 32-bit machine */
 #if __SIZEOF_SIZE_T__ == 4
@@ -2066,14 +2090,16 @@ static int maybe_decompress_payload(
                 return -E2BIG;
 #endif
 
+        size_t skip = FLAGS_SET(flags, SD_JOURNAL_DATA_SKIP_FIELD) && field_length > 0 ? field_length + 1 : 0;
+
         if (compression != COMPRESSION_NONE) {
 #if HAVE_COMPRESSION
                 size_t rsize;
-                int r;
 
                 if (field) {
-                        r = decompress_startswith_journal(compression, payload, size, &f->compress_buffer, field,
-                                                  field_length, '=');
+                        r = decompress_startswith_journal(
+                                        compression, payload, size, &f->compress_buffer,
+                                        field, field_length, '=');
                         if (r < 0)
                                 return log_debug_errno(r,
                                                        "Cannot decompress %s object of length %" PRIu64 ": %m",
@@ -2088,18 +2114,31 @@ static int maybe_decompress_payload(
                         }
 
                         /* Caller only wants to check field existence, skip full decompression */
-                        if (!ret_data && !ret_size)
+                        if (fd < 0 && !ret_data && !ret_size)
                                 return 1;
                 }
 
-                r = decompress_blob_journal(compression, payload, size, &f->compress_buffer, &rsize, DATA_SIZE_MAX);
-                if (r < 0)
-                        return r;
+                if (fd >= 0) {
+                        r = decompress_blob_to_fd_journal(
+                                        compression, payload, size, fd,
+                                        DATA_SIZE_MAX, skip, ret_size);
+                        if (ERRNO_IS_NEG_JOURNAL_CORRUPTION(r))
+                                /* The caller journal_get_data() ignores these errors. Let's use a different
+                                 * error code in that case. Otherwise, junk data may be prepended to the
+                                 * beginning even on success. */
+                                return -EIO;
+                        if (r < 0)
+                                return r;
+                } else {
+                        r = decompress_blob_journal(compression, payload, size, &f->compress_buffer, &rsize, DATA_SIZE_MAX);
+                        if (r < 0)
+                                return r;
 
-                if (ret_data)
-                        *ret_data = f->compress_buffer;
-                if (ret_size)
-                        *ret_size = rsize;
+                        if (ret_data)
+                                *ret_data = (uint8_t*) f->compress_buffer + skip;
+                        if (ret_size)
+                                *ret_size = rsize - skip;
+                }
 #else
                 return -EPROTONOSUPPORT;
 #endif
@@ -2112,6 +2151,15 @@ static int maybe_decompress_payload(
                         return 0;
                 }
 
+                payload += skip;
+                size -= skip;
+
+                if (fd >= 0) {
+                        r = loop_write(fd, payload, size);
+                        if (r < 0)
+                                return r;
+                }
+
                 if (ret_data)
                         *ret_data = payload;
                 if (ret_size)
@@ -2121,13 +2169,14 @@ static int maybe_decompress_payload(
         return 1;
 }
 
-int journal_file_data_payload(
+int journal_file_data_payload_full(
                 JournalFile *f,
                 Object *o,
                 uint64_t offset,
                 const char *field,
                 size_t field_length,
-                size_t data_threshold,
+                sd_journal_data_flags_t flags,
+                int fd,
                 const void **ret_data,
                 size_t *ret_size) {
 
@@ -2137,6 +2186,7 @@ int journal_file_data_payload(
 
         assert(f);
         assert(!field == (field_length == 0)); /* These must be specified together. */
+        assert(fd < 0 || !ret_data); /* fd and ret_data cannot be specified together. */
 
         if (!o) {
                 r = journal_file_move_to_object(f, OBJECT_DATA, offset, &o);
@@ -2154,8 +2204,9 @@ int journal_file_data_payload(
         if (c < 0)
                 return -EPROTONOSUPPORT;
 
-        return maybe_decompress_payload(f, journal_file_data_payload_field(f, o), size, c, field,
-                                        field_length, data_threshold, ret_data, ret_size);
+        return maybe_decompress_payload(
+                        f, journal_file_data_payload_field(f, o), size, c, field, field_length,
+                        flags, fd, ret_data, ret_size);
 }
 
 int journal_file_data_payload_pinned(
@@ -2163,7 +2214,6 @@ int journal_file_data_payload_pinned(
                 uint64_t offset,
                 const char *field,
                 size_t field_length,
-                size_t data_threshold,
                 const void **ret_data,
                 size_t *ret_size) {
 
@@ -2181,7 +2231,9 @@ int journal_file_data_payload_pinned(
         if (r < 0)
                 return r;
 
-        return journal_file_data_payload(f, o, offset, field, field_length, data_threshold, ret_data, ret_size);
+        return journal_file_data_payload(
+                        f, o, offset, field, field_length,
+                        ret_data, ret_size);
 }
 
 uint64_t journal_file_entry_n_items(JournalFile *f, Object *o) {
@@ -2212,14 +2264,15 @@ int journal_file_entry_n_fields(JournalFile *f, Object *o, uint64_t offset, uint
         return 0;
 }
 
-int journal_file_entry_field_payload(
+int journal_file_entry_field_payload_full(
                 JournalFile *f,
                 Object *o,
                 uint64_t offset,
                 uint64_t i,
                 const char *field,
                 size_t field_length,
-                size_t data_threshold,
+                sd_journal_data_flags_t flags,
+                int fd,
                 const void **ret_data,
                 size_t *ret_size) {
 
@@ -2235,12 +2288,12 @@ int journal_file_entry_field_payload(
         if (i >= n)
                 return -EADDRNOTAVAIL;
 
-        return journal_file_data_payload(
+        return journal_file_data_payload_full(
                         f,
                         /* o= */ NULL,
                         journal_file_entry_item_object_offset(f, o, i),
                         field, field_length,
-                        data_threshold,
+                        flags, fd,
                         ret_data, ret_size);
 }
 
@@ -4337,7 +4390,7 @@ static void journal_default_metrics(JournalMetrics *m, int fd, bool compact) {
                   m->n_max_files);
 }
 
-int journal_file_open(
+int journal_file_open_full(
                 int fd,
                 const char *fname,
                 int open_flags,
@@ -4347,6 +4400,7 @@ int journal_file_open(
                 JournalMetrics *metrics,
                 MMapCache *mmap_cache,
                 JournalFile *template,
+                const sd_id128_t *seqnum_id,
                 JournalFile **ret) {
 
         bool newly_created = false;
@@ -4442,7 +4496,7 @@ int journal_file_open(
                  * solely on mtime/atime/ctime of the file. */
                 (void) fd_setcrtime(f->fd, 0);
 
-                r = journal_file_init_header(f, file_flags, template);
+                r = journal_file_init_header(f, file_flags, template, seqnum_id);
                 if (r < 0)
                         goto fail;
 
@@ -4720,7 +4774,6 @@ int journal_file_copy_entry(
                 r = journal_file_entry_field_payload(
                                 from, o, p, i,
                                 /* field= */ NULL, /* field_length= */ 0,
-                                /* data_threshold= */ 0,
                                 &data, &l);
                 if (ERRNO_IS_NEG_JOURNAL_CORRUPTION(r)) {
                         log_debug_errno(r, "Entry item %"PRIu64" data object is bad, skipping over it: %m", i);

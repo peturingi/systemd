@@ -144,7 +144,8 @@ All tools:
   stable `<ROOTHASH>-verity` device mapper name. The default for this depends
   on the subsystem in question. Usually,
   RootImage=/ExtensionImages=/MountImages= in unit files default to enabled,
-  while other uses default to disabled for this.
+  while other uses default to disabled for this. For unprivileged clients of
+  `systemd-mountfsd`, reuse requires the same backing image file.
 
 * `$SYSTEMD_DISSECT_TPM2_UNLOCK=` — takes a boolean. If false, turns off
   unlocking of LUKS encrypted partitions in disk images via a TPM2 token
@@ -573,7 +574,9 @@ disk images with `--image=` or similar:
   (which is the default), the signature of suitable disk images is validated
   against any of the certificates in `/etc/verity.d/*.crt` (and similar
   directories in `/usr/lib/`, `/run`, …) or passed to the kernel for validation
-  against its built-in certificates.
+  against its built-in certificates. A signature that fails validation only
+  prevents activation if the image policy allows `signed` but not `verity`, see
+  `systemd.image-policy(7)`.
 
 * `$SYSTEMD_DISSECT_VERITY_TIMEOUT_SEC=sec` — takes a timespan, which controls
   the timeout waiting for the image to be configured. Defaults to 100 msec.
@@ -590,6 +593,18 @@ disk images with `--image=` or similar:
   unspecified the image dissection logic will automatically probe the file
   system type (subject to `$SYSTEMD_DISSECT_FILE_SYSTEMS`, see above), except
   for ESP and XBOOTLDR where the file system type is set to VFAT.
+
+* `$SYSTEMD_DISSECT_VALIDATEFS=` — takes a boolean, which controls whether to
+  validate the constraints a file system declares about itself via the
+  `user.validatefs.*` extended attributes on its root inode (as set by
+  `systemd-repart`'s `AddValidateFS=` setting, see
+  `systemd-validatefs@.service(8)`), when mounting partitions of a disk image.
+  Defaults to on, in which case a partition whose file system constraints are
+  not fulfilled (for example because it is mounted to a different place than
+  it declares, or because it declares GPT partition metadata constraints but
+  is not placed on a GPT partition) is refused. Set this to "0" to disable
+  validation. Note that when the image is mounted via `systemd-mountfsd`, the
+  environment of the daemon matters, not the one of the client.
 
 * `$SYSTEMD_LOOP_DIRECT_IO` – takes a boolean, which controls whether to enable
   `LO_FLAGS_DIRECT_IO` (i.e. direct IO + asynchronous IO) on loopback block
@@ -786,6 +801,15 @@ SYSTEMD_HOME_DEBUG_SUFFIX=foo \
 
 * `$SYSTEMD_LLDP_SEND_MACHINE_ID` - takes a boolean, If true, systemd-networkd
   sends machine ID as chassis ID through LLDP protocol.
+
+* `$SYSTEMD_NETWORK_MAX_ADDRESSES_PER_LINK` – takes a positive integer.
+  Defaults to 16384. Limits the number of addresses that `systemd-networkd`
+  may add per link.
+
+* `$SYSTEMD_NETWORK_MAX_STATIC_ADDRESSES_PER_NETWORK` – takes a positive
+  integer. Defaults to 8192. Limits the number of static addresses that
+  `systemd-networkd` may add per `.network` file. The effective limit is capped
+  by `$SYSTEMD_NETWORK_MAX_ADDRESSES_PER_LINK`.
 
 `systemd-storagetm`:
 

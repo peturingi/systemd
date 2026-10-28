@@ -171,6 +171,25 @@ static void test_policy_intersect_one(const char *a, const char *b, const char *
         assert_se(image_policy_equivalent(z, t) > 0);
 }
 
+TEST(image_policy_get_verity_sig) {
+        _cleanup_(image_policy_freep) ImagePolicy *p = NULL;
+
+        ASSERT_OK(image_policy_from_string("root=verity+signed", /* graceful= */ false, &p));
+        ASSERT_EQ(image_policy_get(p, PARTITION_ROOT_VERITY_SIG) & _PARTITION_POLICY_USE_MASK, (PartitionPolicyFlags) (PARTITION_POLICY_UNPROTECTED|PARTITION_POLICY_ABSENT));
+        p = image_policy_free(p);
+
+        ASSERT_OK(image_policy_from_string("root=signed", /* graceful= */ false, &p));
+        ASSERT_EQ(image_policy_get(p, PARTITION_ROOT_VERITY_SIG) & _PARTITION_POLICY_USE_MASK, (PartitionPolicyFlags) PARTITION_POLICY_UNPROTECTED);
+        p = image_policy_free(p);
+
+        ASSERT_OK(image_policy_from_string("root=signed+absent", /* graceful= */ false, &p));
+        ASSERT_EQ(image_policy_get(p, PARTITION_ROOT_VERITY_SIG) & _PARTITION_POLICY_USE_MASK, (PartitionPolicyFlags) (PARTITION_POLICY_UNPROTECTED|PARTITION_POLICY_ABSENT));
+        p = image_policy_free(p);
+
+        ASSERT_OK(image_policy_from_string("root=verity", /* graceful= */ false, &p));
+        ASSERT_EQ(image_policy_get(p, PARTITION_ROOT_VERITY_SIG), _PARTITION_POLICY_FLAGS_INVALID);
+}
+
 TEST(image_policy_intersect) {
         test_policy_intersect_one("", "", "", /* intersect= */ true);
         test_policy_intersect_one("-", "-", "-", /* intersect= */ true);
@@ -610,9 +629,9 @@ TEST(image_policy_new_from_dissected) {
 
         policy = image_policy_free(policy);
 
-        /* Test 17: single_file_system=true should NOT set growfs or read-only flags */
+        /* Test 17: bare file system images should NOT set growfs or read-only flags */
         image = (DissectedImage) {
-                .single_file_system = true,
+                .partition_table_type = PARTITION_BARE,
                 .partitions = {
                         [PARTITION_ROOT] = {
                                 .found = true,
@@ -625,7 +644,7 @@ TEST(image_policy_new_from_dissected) {
 
         policy = image_policy_new_from_dissected(&image, /* verity= */ NULL);
         ASSERT_NOT_NULL(policy);
-        /* single_file_system=true means no growfs/read-only flags */
+        /* bare file system images have no growfs/read-only flags */
         ASSERT_EQ(policy->policies[PARTITION_ROOT].flags, (PartitionPolicyFlags) PARTITION_POLICY_EXT4);
 
         policy = image_policy_free(policy);
