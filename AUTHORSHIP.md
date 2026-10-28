@@ -16,3 +16,4 @@ did, what was verified and what was not.
 
 | PR | Subject | Written by | Submitted by |
 |---|---|---|---|
+| [#42014](https://github.com/systemd/systemd/pull/42014) | journal: stop dropping AUDIT_LOGIN records | Claude Opus 4.7, Claude Opus 5 | Pétur Ingi Egilsson |
